@@ -40,9 +40,10 @@
 
 ## 🚀 快速开始
 
-1. 下载发布包：
-   **[`releases/Scrcpy-Android-Console-v1.0.0.zip`](releases/Scrcpy-Android-Console-v1.0.0.zip)**
-   （或直接克隆本仓库——二进制文件都在里面）
+1. 下载便携包（16 MB）：
+   **[`Scrcpy-Android-Console-v1.0.0.zip`](https://github.com/Juzer7113/Scrcpy-Android-Console/releases/download/v1.0.0/Scrcpy-Android-Console-v1.0.0.zip)**
+   —— 仓库里也存了一份：
+   [`releases/Scrcpy-Android-Console-v1.0.0.zip`](releases/Scrcpy-Android-Console-v1.0.0.zip)
 2. 解压到任意位置。**无需安装，无需配置。**
 3. 双击 **`启动控制台.bat`**
 4. 浏览器自动打开 **<http://127.0.0.1:8000>** —— 控制台就跑起来了

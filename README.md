@@ -41,9 +41,10 @@ Perfect for:
 
 ## 🚀 Quick start
 
-1. Download the release package:
-   **[`releases/Scrcpy-Android-Console-v1.0.0.zip`](releases/Scrcpy-Android-Console-v1.0.0.zip)**
-   (or clone this repo — the binaries are included)
+1. Download the portable package (16 MB):
+   **[`Scrcpy-Android-Console-v1.0.0.zip`](https://github.com/Juzer7113/Scrcpy-Android-Console/releases/download/v1.0.0/Scrcpy-Android-Console-v1.0.0.zip)**
+   — a copy also lives in the repo at
+   [`releases/Scrcpy-Android-Console-v1.0.0.zip`](releases/Scrcpy-Android-Console-v1.0.0.zip)
 2. Unzip anywhere. **No installation, no configuration.**
 3. Double-click **`启动控制台.bat`** (`Android Console.bat`)
 4. Your browser opens **<http://127.0.0.1:8000>** — that's it, the console is running.
