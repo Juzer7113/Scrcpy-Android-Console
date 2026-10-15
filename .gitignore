@@ -1,0 +1,18 @@
+# Auto-generated at runtime — safe to delete, rebuilt automatically
+scrcpy/cache/
+scrcpy/uploads/
+scrcpy/devices.json
+
+# Logs & OS junk
+*.log
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# superseded by screenshots/
+/屏幕截图 2026-10-15 185830.png
+/屏幕截图 2026-10-15 185849.png
+/屏幕截图 2026-10-15 185909.png
+
+# release package pushed separately
+/releases/
