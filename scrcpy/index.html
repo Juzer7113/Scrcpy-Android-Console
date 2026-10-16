@@ -305,10 +305,21 @@ button:active{transform:translateY(0)}
 const $ = id => document.getElementById(id);
 const grid = $('grid'), empty = $('empty');
 let devices = [];
+// 后端是单线程的：一个长请求（拉应用列表/启动投屏）期间别再发请求堆积
+let busy = false;
+
+const ESCMAP = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+// 设备备注、应用名（来自 APK 的 label）、adb 原始输出都是不可信文本
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ESCMAP[c]);
+}
 
 function toast(msg){
   const t = $('toast');
-  t.innerHTML = '<div>' + msg + '</div>';
+  const d = document.createElement('div');
+  d.textContent = String(msg == null ? '' : msg);
+  t.innerHTML = '';
+  t.appendChild(d);
   t.classList.add('show');
   clearTimeout(t._t);
   t._t = setTimeout(() => t.classList.remove('show'), 2400);
@@ -334,10 +345,10 @@ function render(){
     el.innerHTML =
       '<div class="chead">' +
         '<span class="dot ' + (ok ? 'ok' : warn ? 'warn' : '') + '"></span>' +
-        '<span class="cname">' + (d.name || '设备 ' + d.ip) + '</span>' +
+        '<span class="cname">' + esc(d.name || '设备 ' + d.ip) + '</span>' +
         '<button class="del" title="移除">×</button>' +
       '</div>' +
-      '<div class="cip">' + d.ip + ':' + d.port + '</div>' +
+      '<div class="cip">' + esc(d.ip + ':' + d.port) + '</div>' +
       '<div class="cmeta">' +
         '<span>' + (ok ? 'ADB 已连接' : warn ? '需在盒子上确认授权' : '未连接') + '</span>' +
         '<span class="tag ' + (ok ? 'ok' : warn ? 'warn' : '') + '">' + statusText(d.status) + '</span>' +
@@ -371,7 +382,7 @@ async function load(){
     devices = r.devices || [];
     render();
     refresh();
-  }catch(e){ toast('后端未启动：请先运行 start.bat'); }
+  }catch(e){ toast('后端未启动：请先运行 启动控制台.bat'); }
 }
 
 async function add(){
@@ -388,6 +399,8 @@ async function add(){
     render();
     $('ip').value = ''; $('name').value = ''; $('ip').focus();
     toast('已添加 ' + ip + ':' + port);
+  }else{
+    toast('添加失败：' + (r.msg || '未知错误'));
   }
 }
 
@@ -398,6 +411,8 @@ async function remove(id){
 }
 
 async function connect(d){
+  if(busy){ toast('后端正忙，请稍候'); return; }
+  busy = true;
   toast('正在启动 ' + d.ip + ':' + d.port + ' ...');
   try{
     const r = await api('/api/connect', {
@@ -408,14 +423,18 @@ async function connect(d){
     if(msg.length > 400) msg = msg.slice(0, 400);
     toast(r.ok ? '已启动控制窗口：' + r.target : '启动失败：' + msg);
   }catch(e){ toast('请求失败：' + e); }
+  finally{ busy = false; }
 }
 
 async function refresh(){
+  if(busy) return;
+  busy = true;
   [...grid.children].forEach(c => { const d = c.querySelector('.dot'); if(d) d.classList.add('loading'); });
   try{
     const r = await api('/api/status', {method:'POST'});
     devices = r.devices || [];
   }catch(e){}
+  finally{ busy = false; }
   render();
 }
 
@@ -434,12 +453,14 @@ async function installApp(d){
   fileInput.onchange = async () => {
     const f = fileInput.files[0];
     if(!f) return;
+    if(busy){ toast('后端正忙，请稍候'); return; }
+    busy = true;
     toast('上传 ' + f.name + ' ...');
     try{
       const u = await fetch('/api/upload?name=' + encodeURIComponent(f.name), {
         method:'POST', body:f, headers:{'Content-Type':'application/octet-stream'}
       }).then(r => r.json());
-      if(!u.ok){ toast('上传失败'); return; }
+      if(!u.ok){ toast('上传失败：' + (u.msg || '未知错误')); return; }
       toast('安装中，请稍候 ...');
       const r = await api('/api/install', {
         method:'POST', headers:{'Content-Type':'application/json'},
@@ -447,11 +468,14 @@ async function installApp(d){
       });
       toast(r.ok ? '安装成功' : '安装失败：' + String(r.msg || '').slice(0, 90));
     }catch(e){ toast('出错：' + e); }
+    finally{ busy = false; }
   };
   fileInput.click();
 }
 
 async function openApps(d){
+  if(busy){ toast('后端正忙，请稍候'); return; }
+  busy = true;
   curDev = d;
   mask.classList.add('show');
   $('mTitle').textContent = d.name || d.ip;
@@ -468,6 +492,7 @@ async function openApps(d){
     if(!curApps.length) appList.innerHTML = '<div class="loading">没有第三方应用</div>';
     else renderApps();
   }catch(e){ appList.innerHTML = '<div class="loading">读取失败：后端未启动</div>'; }
+  finally{ busy = false; }
 }
 
 function renderApps(){
@@ -480,12 +505,12 @@ function renderApps(){
     const el = document.createElement('div');
     el.className = 'app';
     el.innerHTML =
-      '<div class="ic"><span>' + (a.name || a.pkg).charAt(0).toUpperCase() + '</span>' +
+      '<div class="ic"><span>' + esc((a.name || a.pkg).charAt(0).toUpperCase()) + '</span>' +
       (a.icon ? '<img class="icimg" src="/api/icon?pkg=' + encodeURIComponent(a.pkg) + '" onerror="this.style.display=\'none\'">' : '') +
       '</div>' +
       '<div class="appinfo">' +
-        '<div class="n">' + (a.name || a.pkg.split('.').pop()) + '</div>' +
-        '<div class="p">' + a.pkg + '</div>' +
+        '<div class="n">' + esc(a.name || a.pkg.split('.').pop()) + '</div>' +
+        '<div class="p">' + esc(a.pkg) + '</div>' +
         '<div class="s">' + fmtSize(a.size) + '</div>' +
       '</div>' +
       '<button class="uninst">卸载</button>';
@@ -496,6 +521,8 @@ function renderApps(){
 
 async function uninstallApp(a){
   if(!confirm('确定卸载？\n' + (a.name || a.pkg) + '\n' + a.pkg)) return;
+  if(busy){ toast('后端正忙，请稍候'); return; }
+  busy = true;
   toast('正在卸载 ' + (a.name || a.pkg) + ' ...');
   try{
     const r = await api('/api/uninstall', {
@@ -505,6 +532,7 @@ async function uninstallApp(a){
     toast(r.ok ? '已卸载' : '卸载失败：' + String(r.msg || '').slice(0, 90));
     if(r.ok){ curApps = curApps.filter(x => x.pkg !== a.pkg); renderApps(); }
   }catch(e){ toast('出错：' + e); }
+  finally{ busy = false; }
 }
 
 $('mClose').onclick = () => mask.classList.remove('show');
@@ -513,13 +541,14 @@ appSearch.oninput = renderApps;
 document.addEventListener('keydown', e => { if(e.key === 'Escape') mask.classList.remove('show'); });
 
 $('btnAdd').onclick = add;
-$('btnRefresh').onclick = refresh;
+// 手动点刷新要给反馈；30 秒自动刷新则安静跳过
+$('btnRefresh').onclick = () => { if(busy){ toast('后端正忙，请稍候'); return; } refresh(); };
 ['ip','port','name'].forEach(id => {
   $(id).addEventListener('keydown', e => { if(e.key === 'Enter') add(); });
 });
 
 load();
-setInterval(refresh, 30000);
+setInterval(() => { if(!busy && !document.hidden) refresh(); }, 30000);
 </script>
 </body>
 </html>

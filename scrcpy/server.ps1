@@ -7,24 +7,56 @@ $SCRCPY  = Join-Path $BASE 'scrcpy.exe'
 $DB      = Join-Path $BASE 'devices.json'
 $PORT    = 8000
 
-# SW-618 STB needs a specific hw encoder + all-I-frame workaround.
-# Everything else (emulators, normal devices) uses scrcpy defaults.
-$VIDEO_ARGS_SW618 = @(
+# allwinner hw encoder has a known bug: emits corrupt streams (ref-frames
+# exceeds max, then QP out of range) that crash FFmpeg. The fix is to force
+# all-I-frames (i-frame-interval=0) so frames have no cross-frame dependency.
+# This applies to SW-618 and any Amlogic box that ships the allwinner encoder.
+$VIDEO_ARGS_ALLWINNER = @(
   '--video-codec=h264',
   '--video-encoder=OMX.allwinner.video.encoder.avc',
   '--max-size=1280',
   '--max-fps=25',
   '--video-bit-rate=4M',
-  '--video-codec-options=i-frame-interval=0'
+  '--video-codec-options=i-frame-interval=0',
+  '--no-audio'
 )
+
+# Fallback for allwinner boxes whose hw encoder emits unusable streams
+# (frames never reach the decoder). Lower spec + software encoder.
+$VIDEO_ARGS_SWFALLBACK = @(
+  '--video-codec=h264',
+  '--video-encoder=c2.android.avc.encoder',
+  '--max-size=640',
+  '--max-fps=15',
+  '--video-bit-rate=1M',
+  '--no-audio'
+)
+
+$ENCODER_CACHE = @{}
 
 function Video-Args-For($t) {
   $model = ''
   try { $model = (& $ADB -s $t shell getprop ro.product.model 2>$null | Out-String).Trim() } catch {}
   Write-Host ('[launch] device model = ' + $model)
-  if ($model -match 'SW-?618' -or $model -match 'Amlogic\s+SW') {
-    Write-Host '[launch] using SW-618 encoder workaround'
-    return $VIDEO_ARGS_SW618
+
+  # $model is diagnostic only - encoder choice comes from the probe below
+  # detect allwinner hw encoder (cached per device, ~1s one-time cost)
+  $useAllwinner = $false
+  if ($ENCODER_CACHE.ContainsKey($t)) {
+    $useAllwinner = $ENCODER_CACHE[$t]
+  } else {
+    try {
+      $r = Invoke-Proc $SCRCPY ('-s ' + $t + ' --list-encoders')
+      if ($r.out -match 'OMX\.allwinner\.video\.encoder\.avc\s*\(hw\)') {
+        $useAllwinner = $true
+      }
+    } catch {}
+    $ENCODER_CACHE[$t] = $useAllwinner
+  }
+
+  if ($useAllwinner) {
+    Write-Host '[launch] allwinner hw encoder detected - using all-I-frame workaround'
+    return $VIDEO_ARGS_ALLWINNER
   }
   Write-Host '[launch] using default encoder (conservative profile for low-end devices)'
   return @('--max-size=1024', '--max-fps=30', '--video-bit-rate=4M', '--no-audio')
@@ -85,11 +117,17 @@ function Invoke-Proc($exe, $argLine) {
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError = $true
   $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8   # aapt emits UTF-8 (Khmer labels etc.)
+  $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
   $p = [System.Diagnostics.Process]::Start($psi)
+  # stderr must be drained concurrently - blocking on one pipe while the other
+  # fills its ~4KB buffer deadlocks both sides
+  $errTask = $p.StandardError.ReadToEndAsync()
   $o = $p.StandardOutput.ReadToEnd()
-  $e = $p.StandardError.ReadToEnd()
-  $p.WaitForExit(180000) | Out-Null
-  return @{ code = $p.ExitCode; out = $o; err = $e }
+  if (-not $p.WaitForExit(180000)) {
+    try { $p.Kill() } catch {}
+    return @{ code = -1; out = $o; err = 'timed out after 180s' }
+  }
+  return @{ code = $p.ExitCode; out = $o; err = $errTask.Result }
 }
 
 # parse "aapt dump badging" output -> label + best icon path
@@ -152,6 +190,36 @@ function Set-AppCache($pkg, $metaObj) {
   [System.IO.File]::WriteAllText((Join-Path $dir 'meta.json'), ($metaObj | ConvertTo-Json -Compress), $utf8)
 }
 
+# ---- input validation ----
+# every one of these values ends up inside an adb/scrcpy command line built by
+# string concatenation, and "adb shell" hands its arguments to a shell on the
+# device - so anything with a space, quote or ';' in it must never get that far.
+function Valid-Host($s) {
+  $s = [string]$s
+  if ($s.Length -lt 1 -or $s.Length -gt 253) { return $false }
+  if ($s -match '\.\.') { return $false }
+  return ($s -match '^[A-Za-z0-9]([A-Za-z0-9.\-]*[A-Za-z0-9])?$')
+}
+
+function Valid-Port($s) {
+  $s = [string]$s
+  if ($s -notmatch '^[0-9]{1,5}$') { return $false }
+  $n = [int]$s
+  return ($n -ge 1 -and $n -le 65535)
+}
+
+# android package name: dot-separated [A-Za-z0-9_] segments, nothing else
+function Valid-Pkg($s) {
+  $s = [string]$s
+  if ($s.Length -lt 1 -or $s.Length -gt 255) { return $false }
+  return ($s -match '^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$')
+}
+
+# set a property that may not exist yet (ConvertFrom-Json objects throw on plain assignment)
+function Set-Prop($o, $name, $val) {
+  $o | Add-Member -NotePropertyName $name -NotePropertyValue $val -Force
+}
+
 function Get-Devs {
   if (-not (Test-Path $DB)) { return @() }
   try {
@@ -173,7 +241,20 @@ function Get-Devs {
       }
     }
     if ($list.Count -eq 1 -and $null -eq $list[0]) { return @() }
-    return $list
+    # normalize + sanitize: downstream code pastes ip/port into command lines and
+    # assigns to .status/.name, which throws on a json object that lacks them
+    $out = New-Object System.Collections.ArrayList
+    foreach ($d in $list) {
+      if ($null -eq $d) { continue }
+      if (-not (Valid-Host $d.ip)) { continue }
+      if (-not [string]$d.port) { Set-Prop $d 'port' '5555' }
+      if (-not (Valid-Port $d.port)) { continue }
+      if (-not ($d.PSObject.Properties.Name -contains 'id'))     { Set-Prop $d 'id' ([guid]::NewGuid().ToString().Substring(0, 8)) }
+      if (-not ($d.PSObject.Properties.Name -contains 'name'))   { Set-Prop $d 'name' '' }
+      if (-not ($d.PSObject.Properties.Name -contains 'status')) { Set-Prop $d 'status' 'unknown' }
+      $null = $out.Add($d)
+    }
+    return @($out)
   } catch { return @() }
 }
 
@@ -221,11 +302,15 @@ function Invoke-Adb($argLine) {
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError = $true
   $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+  $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
   $p = [System.Diagnostics.Process]::Start($psi)
+  $errTask = $p.StandardError.ReadToEndAsync()
   $o = $p.StandardOutput.ReadToEnd()
-  $e = $p.StandardError.ReadToEnd()
-  $p.WaitForExit(180000) | Out-Null
-  return @{ code = $p.ExitCode; out = $o; err = $e }
+  if (-not $p.WaitForExit(180000)) {
+    try { $p.Kill() } catch {}
+    return @{ code = -1; out = $o; err = 'timed out after 180s' }
+  }
+  return @{ code = $p.ExitCode; out = $o; err = $errTask.Result }
 }
 
 function Resp($ctx, $code, $bytes, $ctype) {
@@ -271,12 +356,76 @@ function Refresh-Status {
       if ($matches[1] -like '*:*') { $state[$matches[1]] = $matches[2] }
     }
   }
+  $changed = $false
   foreach ($d in $devs) {
     $t = Target $d
-    if ($state.ContainsKey($t)) { $d.status = $state[$t] } else { $d.status = 'offline' }
+    $new = 'offline'
+    if ($state.ContainsKey($t)) { $new = $state[$t] }
+    if ([string]$d.status -ne $new) { Set-Prop $d 'status' $new; $changed = $true }
   }
-  Save-Devs $devs
+  if ($changed) { Save-Devs $devs }   # don't rewrite the file on every 30s poll
   return @($devs)
+}
+
+# Start a long-lived process with BOTH pipes drained for its whole lifetime.
+# A redirected pipe nobody reads fills at ~4KB and blocks the writer for good,
+# which freezes the mirroring window mid-session.
+# BeginOutput/ErrorReadLine keeps draining even after the handlers are removed.
+function Start-Drained($exe, $argLine) {
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $exe
+  $psi.Arguments = $argLine
+  $psi.WorkingDirectory = $BASE
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+  $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
+  $p = [System.Diagnostics.Process]::Start($psi)
+  # synchronized: the event handlers run on another thread while we enumerate
+  $outBuf = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+  $errBuf = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+  $so = Register-ObjectEvent -InputObject $p -EventName OutputDataReceived -MessageData $outBuf -Action {
+    if ($EventArgs.Data) { $null = $MessageData.Add($EventArgs.Data) }
+  }
+  $se = Register-ObjectEvent -InputObject $p -EventName ErrorDataReceived -MessageData $errBuf -Action {
+    if ($EventArgs.Data) { $null = $MessageData.Add($EventArgs.Data) }
+  }
+  $p.BeginOutputReadLine()
+  $p.BeginErrorReadLine()
+  return @{ p = $p; out = $outBuf; err = $errBuf; subs = @($so.Name, $se.Name) }
+}
+
+# drop the line collectors once the probe window is over (the pipes keep draining)
+function Stop-Collect($h) {
+  foreach ($s in $h.subs) { Unregister-Event -SourceIdentifier $s -ErrorAction SilentlyContinue }
+}
+
+function Lines-Of($buf) {
+  try { return @($buf.ToArray()) } catch { return @() }
+}
+
+function Start-Scrcpy($t, $vargs) {
+  $arg = '-s ' + $t + ' --window-title="STB ' + $t + '" ' + ($vargs -join ' ')
+  return Start-Drained $SCRCPY $arg
+}
+
+# scrcpy creates its window only once it has decoded a frame, so a window is
+# proof that frames are actually arriving. Watching the log instead does not
+# work: a redirected stdout is block-buffered inside scrcpy and stays empty
+# for minutes, which made the old --print-fps probe always report failure.
+function Wait-Window($p, $ms) {
+  $deadline = (Get-Date).AddMilliseconds($ms)
+  while ((Get-Date) -lt $deadline) {
+    if ($p.HasExited) { return $false }
+    try {
+      $p.Refresh()
+      if ($p.MainWindowHandle -ne [System.IntPtr]::Zero) { return $true }
+    } catch {}
+    Start-Sleep -Milliseconds 250
+  }
+  return $false
 }
 
 function Launch($d) {
@@ -295,26 +444,54 @@ function Launch($d) {
   }
 
   $vargs = Video-Args-For $t
-  $arg = '-s ' + $t + ' --window-title="STB ' + $t + '" ' + ($vargs -join ' ')
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $SCRCPY
-  $psi.Arguments = $arg
-  $psi.WorkingDirectory = $BASE
-  $psi.UseShellExecute = $false
-  $psi.CreateNoWindow = $true
-  $psi.RedirectStandardError = $true
+  $isAllwinner = ($vargs -join ' ') -match 'allwinner'
   try {
-    $p = [System.Diagnostics.Process]::Start($psi)
+    $h = Start-Scrcpy $t $vargs
   } catch {
     return @{ ok = $false; msg = 'cannot start scrcpy: ' + $_.Exception.Message }
   }
-  Start-Sleep -Milliseconds 1200
+  $p = $h.p
+
+  Start-Sleep -Milliseconds 1500
   if ($p.HasExited) {
-    $e = $p.StandardError.ReadToEnd()
+    Stop-Collect $h
+    $e = (((Lines-Of $h.err) + (Lines-Of $h.out)) -join ' ').Trim()
     if (-not $e) { $e = 'scrcpy exited immediately (code ' + $p.ExitCode + ')' }
     Write-Host ('[launch] FAILED ' + $t + ' :: ' + ($e -replace "\s+", ' '))
     return @{ ok = $false; msg = $e }
   }
+
+  # allwinner hw encoder: give it 5s to put a window up. no window means no
+  # decoded frame, i.e. the stream is unusable -> retry with software fallback.
+  if ($isAllwinner) {
+    $gotFrame = Wait-Window $p 5000
+    Stop-Collect $h
+    if (-not $gotFrame) {
+      Write-Host ('[launch] allwinner hw encoder produced no frames for ' + $t + ' - falling back to software encoder')
+      try { $p.Kill() } catch {}
+      try { $p.WaitForExit(2000) | Out-Null } catch {}
+      try {
+        $h2 = Start-Scrcpy $t $VIDEO_ARGS_SWFALLBACK
+      } catch {
+        return @{ ok = $false; msg = 'cannot start scrcpy (sw fallback): ' + $_.Exception.Message }
+      }
+      Start-Sleep -Milliseconds 1500
+      if ($h2.p.HasExited) {
+        Stop-Collect $h2
+        $e2 = (((Lines-Of $h2.err) + (Lines-Of $h2.out)) -join ' ').Trim()
+        if (-not $e2) { $e2 = 'sw fallback exited immediately (code ' + $h2.p.ExitCode + ')' }
+        Write-Host ('[launch] SW-FALLBACK FAILED ' + $t + ' :: ' + ($e2 -replace "\s+", ' '))
+        return @{ ok = $false; msg = $e2 }
+      }
+      Stop-Collect $h2
+      Write-Host ('[launch] OK (sw fallback) ' + $t)
+      return @{ ok = $true; target = $t; mode = 'sw' }
+    }
+    Write-Host ('[launch] OK (hw allwinner) ' + $t)
+    return @{ ok = $true; target = $t; mode = 'hw' }
+  }
+
+  Stop-Collect $h
   Write-Host ('[launch] OK ' + $t)
   return @{ ok = $true; target = $t }
 }
@@ -330,6 +507,16 @@ try { $listener.Start() } catch {
 
 Write-Host "STB console running: http://127.0.0.1:$PORT"
 Write-Host "adb=$ADB"
+
+# uploads/ is a temp dir: clear whatever a previous run left behind
+$UPDIR = Join-Path $BASE 'uploads'
+if (Test-Path $UPDIR) {
+  try { Get-ChildItem $UPDIR -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue } catch {}
+}
+
+$OKHOSTS = @("127.0.0.1:$PORT", "localhost:$PORT")
+$OKORIGINS = @("http://127.0.0.1:$PORT", "http://localhost:$PORT")
+
 if (-not $NoBrowser) { Start-Process "http://127.0.0.1:$PORT" }
 
 while ($listener.IsListening) {
@@ -340,6 +527,17 @@ while ($listener.IsListening) {
     $path = $req.Url.AbsolutePath
     $m    = $req.HttpMethod.ToUpper()
 
+    # Listening on loopback is not access control: any page the user happens to
+    # have open can POST here, and with DNS rebinding it can read the replies
+    # too. Requests must carry our own Host and must not be cross-origin.
+    $hostHdr = [string]$req.UserHostName
+    $origin  = [string]$req.Headers['Origin']
+    if (($OKHOSTS -notcontains $hostHdr) -or ($origin -and ($OKORIGINS -notcontains $origin))) {
+      Write-Host ('[block] ' + $m + ' ' + $path + ' host=' + $hostHdr + ' origin=' + $origin)
+      Resp $ctx 403 ([System.Text.Encoding]::UTF8.GetBytes('forbidden')) 'text/plain'
+      continue
+    }
+
     if ($m -eq 'GET' -and ($path -eq '/' -or $path -eq '/index.html')) {
       $bytes = [System.IO.File]::ReadAllBytes((Join-Path $BASE 'index.html'))
       Resp $ctx 200 $bytes 'text/html; charset=utf-8'
@@ -347,7 +545,7 @@ while ($listener.IsListening) {
     } elseif ($m -eq 'GET' -and $path -eq '/api/devices') {
       RespRaw $ctx ('{"ver":3,"devices":' + (Json-Array (Get-Devs)) + '}')
 
-    } elseif ($path -eq '/api/status') {
+    } elseif ($m -eq 'POST' -and $path -eq '/api/status') {
       RespRaw $ctx ('{"ver":3,"devices":' + (Json-Array (Refresh-Status)) + '}')
 
     } elseif ($m -eq 'POST' -and $path -eq '/api/devices') {
@@ -355,15 +553,18 @@ while ($listener.IsListening) {
       $raw = $sr.ReadToEnd(); $sr.Close()
       $b = @{}
       if ($raw) { try { $b = $raw | ConvertFrom-Json } catch { $b = @{} } }
-      $ip   = [string]$b.ip
-      $port = [string]$b.port; if (-not $port) { $port = '5555' }
+      $ip   = ([string]$b.ip).Trim()
+      $port = ([string]$b.port).Trim(); if (-not $port) { $port = '5555' }
       $name = [string]$b.name
       if (-not $ip) { RespJson $ctx @{ ok = $false; msg = 'IP is empty' }; continue }
+      if (-not (Valid-Host $ip)) { RespJson $ctx @{ ok = $false; msg = 'invalid IP / host: ' + $ip }; continue }
+      if (-not (Valid-Port $port)) { RespJson $ctx @{ ok = $false; msg = 'invalid port: ' + $port }; continue }
+      if ($name.Length -gt 60) { $name = $name.Substring(0, 60) }
 
       $devs = @(Get-Devs)
       $dup  = $false
       foreach ($d in $devs) {
-        if ($d.ip -eq $ip -and [string]$d.port -eq $port) { $d.name = $name; $dup = $true }
+        if ($d.ip -eq $ip -and [string]$d.port -eq $port) { Set-Prop $d 'name' $name; $dup = $true }
       }
       if (-not $dup) {
         $id = [guid]::NewGuid().ToString().Substring(0, 8)
@@ -381,27 +582,48 @@ while ($listener.IsListening) {
       RespJson $ctx @{ ok = $r.ok; msg = [string]$r.msg; target = [string]$r.target }
 
     } elseif ($m -eq 'POST' -and $path -eq '/api/upload') {
+      # this name lands on disk and then inside an adb command line: keep it boring
       $name = [System.IO.Path]::GetFileName([string]$req.QueryString['name'])
-      if (-not $name) { $name = 'app.apk' }
+      $name = ($name -replace '[^A-Za-z0-9._\-]', '_')
+      if ($name.Length -gt 100) { $name = $name.Substring(0, 100) }
+      if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._\-]*\.apk$') { $name = 'app.apk' }
+      $MAXUP = 1073741824   # 1 GB
+      if ($req.ContentLength64 -gt $MAXUP) { RespJson $ctx @{ ok = $false; msg = 'apk too large (max 1 GB)' }; continue }
       $upDir = Join-Path $BASE 'uploads'
-      if (-not (Test-Path $upDir)) { New-Item -ItemType Directory -Path $upDir | Out-Null }
+      if (-not (Test-Path $upDir)) { New-Item -ItemType Directory -Path $upDir -Force | Out-Null }
       $dest = Join-Path $upDir $name
+      $total = 0
       $fs = [System.IO.File]::Create($dest)
-      try { $req.InputStream.CopyTo($fs) } finally { $fs.Close() }
-      RespJson $ctx @{ ok = $true; file = $name; size = (Get-Item $dest).Length }
+      try {
+        $buf = New-Object byte[] 65536
+        while (($n = $req.InputStream.Read($buf, 0, $buf.Length)) -gt 0) {
+          $total += $n
+          if ($total -gt $MAXUP) { break }
+          $fs.Write($buf, 0, $n)
+        }
+      } finally { $fs.Close() }
+      if ($total -gt $MAXUP) {
+        try { Remove-Item $dest -Force -ErrorAction SilentlyContinue } catch {}
+        RespJson $ctx @{ ok = $false; msg = 'apk too large (max 1 GB)' }
+        continue
+      }
+      RespJson $ctx @{ ok = $true; file = $name; size = $total }
 
     } elseif ($m -eq 'POST' -and $path -eq '/api/install') {
       $b = Read-Body $req
       $d = Find-Dev $b.id
       if (-not $d) { RespJson $ctx @{ ok = $false; msg = 'device not found' }; continue }
-      $apk = Join-Path (Join-Path $BASE 'uploads') ([System.IO.Path]::GetFileName([string]$b.file))
-      if (-not (Test-Path $apk)) { RespJson $ctx @{ ok = $false; msg = 'apk not uploaded' }; continue }
+      $fname = [System.IO.Path]::GetFileName([string]$b.file)
+      if ($fname -notmatch '^[A-Za-z0-9][A-Za-z0-9._\-]*\.apk$') { RespJson $ctx @{ ok = $false; msg = 'bad file name' }; continue }
+      $apk = Join-Path (Join-Path $BASE 'uploads') $fname
+      if (-not (Test-Path $apk -PathType Leaf)) { RespJson $ctx @{ ok = $false; msg = 'apk not uploaded' }; continue }
       $t = Target $d
       & $ADB connect $t 2>$null | Out-Null
       $r = Invoke-Adb ('-s ' + $t + ' install -r "' + $apk + '"')
       $msg = ($r.out + ' ' + $r.err)
       $ok = ($msg -match 'Success')
-      if ($ok) { try { Remove-Item $apk -Force -ErrorAction SilentlyContinue } catch {} }
+      # uploads/ is a temp dir: drop the file either way, a failed install used to leak it
+      try { Remove-Item $apk -Force -ErrorAction SilentlyContinue } catch {}
       if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) }
       RespJson $ctx @{ ok = $ok; msg = $msg.Trim() }
 
@@ -416,7 +638,10 @@ while ($listener.IsListening) {
       $map = @{}
       foreach ($line in ($raw.out -split "`r?`n")) {
         # format: package:<apk-path>=<pkg>  -- the path contains '==', so split on the LAST '='
-        if ($line -match '^package:(\S+)=(\S+)\s*$') { $map[$matches[2]] = $matches[1].Trim() }
+        if ($line -match '^package:(\S+)=(\S+)\s*$') {
+          # the name becomes a cache dir and a temp file name: reject anything odd
+          if (Valid-Pkg $matches[2]) { $map[$matches[2]] = $matches[1].Trim() }
+        }
       }
       $pkgs = @($map.Keys)
 
@@ -425,10 +650,10 @@ while ($listener.IsListening) {
       for ($i = 0; $i -lt $pkgs.Count; $i += 25) {
         $end = [Math]::Min($i + 24, $pkgs.Count - 1)
         $chunk = @($pkgs[$i..$end])
-        $paths = @($chunk | ForEach-Object { $map[$_] })
+        $paths = @($chunk | ForEach-Object { '"' + $map[$_] + '"' })
         $r = Invoke-Adb ('-s ' + $t + ' shell wc -c ' + ($paths -join ' '))
         foreach ($line in ($r.out -split "`r?`n")) {
-          if ($line -match '^\s*(\d+)\s+(/\S+)\s*$') { $sizes[$matches[2]] = [int64]$matches[1] }
+          if ($line -match '^\s*(\d+)\s+(/.*?)\s*$') { $sizes[$matches[2]] = [int64]$matches[1] }
         }
       }
 
@@ -478,7 +703,7 @@ while ($listener.IsListening) {
           for ($i = 0; $i -lt $pkgs.Count; $i += 10) {
             $end = [Math]::Min($i + 9, $pkgs.Count - 1)
             $chunk = @($pkgs[$i..$end])
-            $paths = @($chunk | ForEach-Object { $map[$_] })
+            $paths = @($chunk | ForEach-Object { '"' + $map[$_] + '"' })
             $r = Invoke-Adb ('-s ' + $t + ' shell aapt dump badging ' + ($paths -join ' '))
             $cur = ''
             foreach ($line in ($r.out -split "`r?`n")) {
@@ -506,7 +731,7 @@ while ($listener.IsListening) {
     } elseif ($m -eq 'GET' -and $path -eq '/api/icon') {
       $pkg = [string]$req.QueryString['pkg']
       $sent = $false
-      if ($pkg -match '^[A-Za-z0-9._]+$') {
+      if (Valid-Pkg $pkg) {
         $c = Get-AppCache $pkg
         if ($c -and $c.icon) {
           $f = Join-Path (Join-Path $APPCACHE $pkg) ([string]$c.icon)
@@ -529,7 +754,9 @@ while ($listener.IsListening) {
       $d = Find-Dev $b.id
       if (-not $d) { RespJson $ctx @{ ok = $false; msg = 'device not found' }; continue }
       $t = Target $d
-      $pkg = [string]$b.pkg
+      $pkg = ([string]$b.pkg).Trim()
+      # goes into "adb shell pm uninstall ...", i.e. straight to a shell on the device
+      if (-not (Valid-Pkg $pkg)) { RespJson $ctx @{ ok = $false; msg = 'invalid package name' }; continue }
       $r = Invoke-Adb ('-s ' + $t + ' uninstall ' + $pkg)
       $msg = ($r.out + ' ' + $r.err).Trim()
       if ($msg -notmatch 'Success') {

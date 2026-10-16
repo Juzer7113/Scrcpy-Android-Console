@@ -7,7 +7,8 @@ set /p STBIP=Enter device IP [e.g. 192.168.1.253]:
 if "%STBIP%"=="" goto END
 
 echo [1/2] adb connect %STBIP%:5555 ...
-adb connect %STBIP%:5555
+rem adb connect exits 0 even when it fails - check the output instead
+adb connect %STBIP%:5555 | findstr /i "connected" >nul
 if errorlevel 1 goto FAIL
 
 echo [2/2] starting scrcpy ...
