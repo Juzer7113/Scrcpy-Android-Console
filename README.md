@@ -9,7 +9,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square)](https://github.com/Juzer7113/Scrcpy-Android-Console)
 [![Zero Dependency](https://img.shields.io/badge/runtime-zero--dependency-brightgreen?style=flat-square)](https://github.com/Juzer7113/Scrcpy-Android-Console)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](LICENSE)
-[![Release](https://img.shields.io/badge/download-v1.0.0-orange?style=flat-square)](releases/Scrcpy-Android-Console-v1.0.0.zip)
+[![Release](https://img.shields.io/badge/download-v1.0.1-orange?style=flat-square)](releases/Scrcpy-Android-Console-v1.0.1.zip)
 
 </div>
 
@@ -42,9 +42,9 @@ Perfect for:
 ## 🚀 Quick start
 
 1. Download the portable package (16 MB):
-   **[`Scrcpy-Android-Console-v1.0.0.zip`](https://github.com/Juzer7113/Scrcpy-Android-Console/releases/download/v1.0.0/Scrcpy-Android-Console-v1.0.0.zip)**
+   **[`Scrcpy-Android-Console-v1.0.1.zip`](https://github.com/Juzer7113/Scrcpy-Android-Console/releases/download/v1.0.1/Scrcpy-Android-Console-v1.0.1.zip)**
    — a copy also lives in the repo at
-   [`releases/Scrcpy-Android-Console-v1.0.0.zip`](releases/Scrcpy-Android-Console-v1.0.0.zip)
+   [`releases/Scrcpy-Android-Console-v1.0.1.zip`](releases/Scrcpy-Android-Console-v1.0.1.zip)
 2. Unzip anywhere. **No installation, no configuration.**
 3. Double-click **`启动控制台.bat`** (`Android Console.bat`)
 4. Your browser opens **<http://127.0.0.1:8000>** — that's it, the console is running.

@@ -9,7 +9,7 @@
 [![平台](https://img.shields.io/badge/平台-Windows-0078D6?style=flat-square)](https://github.com/Juzer7113/Scrcpy-Android-Console)
 [![零依赖](https://img.shields.io/badge/运行时-零依赖-brightgreen?style=flat-square)](https://github.com/Juzer7113/Scrcpy-Android-Console)
 [![许可证](https://img.shields.io/badge/许可证-Apache--2.0-blue?style=flat-square)](LICENSE)
-[![下载](https://img.shields.io/badge/下载-v1.0.0-orange?style=flat-square)](releases/Scrcpy-Android-Console-v1.0.0.zip)
+[![下载](https://img.shields.io/badge/下载-v1.0.1-orange?style=flat-square)](releases/Scrcpy-Android-Console-v1.0.1.zip)
 
 </div>
 
@@ -41,9 +41,9 @@
 ## 🚀 快速开始
 
 1. 下载便携包（16 MB）：
-   **[`Scrcpy-Android-Console-v1.0.0.zip`](https://github.com/Juzer7113/Scrcpy-Android-Console/releases/download/v1.0.0/Scrcpy-Android-Console-v1.0.0.zip)**
+   **[`Scrcpy-Android-Console-v1.0.1.zip`](https://github.com/Juzer7113/Scrcpy-Android-Console/releases/download/v1.0.1/Scrcpy-Android-Console-v1.0.1.zip)**
    —— 仓库里也存了一份：
-   [`releases/Scrcpy-Android-Console-v1.0.0.zip`](releases/Scrcpy-Android-Console-v1.0.0.zip)
+   [`releases/Scrcpy-Android-Console-v1.0.1.zip`](releases/Scrcpy-Android-Console-v1.0.1.zip)
 2. 解压到任意位置。**无需安装，无需配置。**
 3. 双击 **`启动控制台.bat`**
 4. 浏览器自动打开 **<http://127.0.0.1:8000>** —— 控制台就跑起来了
